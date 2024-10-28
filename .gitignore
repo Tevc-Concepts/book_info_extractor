@@ -1,0 +1,10 @@
+# Environments
+.env
+.venv
+.log
+env/
+venv/
+__pycache__/
+book_covers/
+*.db
+*.csv
