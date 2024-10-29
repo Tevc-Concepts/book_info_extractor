@@ -8,3 +8,5 @@ __pycache__/
 book_covers/
 *.db
 *.csv
+*.log
+*.txt

@@ -25,8 +25,8 @@ class Config:
     OUTPUT_CSV_PATH = os.getenv('OUTPUT_CSV_PATH', 'book_data.csv')
     IMAGE_FOLDER = os.getenv('IMAGE_FOLDER', 'book_covers')
     DATABASE_PATH = os.getenv('DATABASE_PATH', 'books.db')
-    BATCH_SIZE = int(os.getenv('BATCH_SIZE', '50'))
-    LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+    BATCH_SIZE = int(os.getenv('BATCH_SIZE', '100'))
+    LOG_LEVEL = os.getenv('LOG_LEVEL', 'DEBUG')
     GOODREADS_USER_AGENT = os.getenv('GOODREADS_USER_AGENT', 
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
 
@@ -72,10 +72,10 @@ class BookDataExtractor:
         self.session = None
         self.initialize_database()
         self.ensure_image_folder()
-        # Add rate limiting parameters
-        self.requests_per_minute = 50  # Google Books API default limit is 60 but I used 50
-        self.last_request_time = time.time()
-        self.request_count = 0
+        # Rate limiting parameters
+        self.requests_window = []  # Track timestamp of requests
+        self.max_requests = 60     # Maximum requests per minute
+        self.window_size = 60      # Window size in seconds
 
     def ensure_image_folder(self):
         """Create image folder if it doesn't exist."""
@@ -139,6 +139,29 @@ class BookDataExtractor:
 
     @sleep_and_retry
     @limits(calls=1000, period=3600)
+
+    async def check_rate_limit(self):
+        """Check and enforce rate limiting."""
+        current_time = time.time()
+        
+        # Remove timestamps older than our window
+        self.requests_window = [t for t in self.requests_window 
+                              if current_time - t < self.window_size]
+        
+        # If we've hit our limit, calculate wait time
+        if len(self.requests_window) >= self.max_requests:
+            oldest_request = min(self.requests_window)
+            wait_time = oldest_request + self.window_size - current_time
+            if wait_time > 0:
+                logging.info(f"Rate limit reached. Waiting {wait_time:.2f} seconds... "
+                           f"(Requests in window: {len(self.requests_window)})")
+                await asyncio.sleep(wait_time)
+                # Recheck after sleeping
+                return await self.check_rate_limit()
+        
+        # Add current request timestamp
+        self.requests_window.append(current_time)
+
     
     async def fetch_google_books(self, isbn: str) -> Optional[BookInfo]:
         """Fetch book information from Google Books API with rate limiting."""
@@ -147,28 +170,21 @@ class BookDataExtractor:
         
         while retry_count < max_retries:
             try:
-                # Implement rate limiting
-                current_time = time.time()
-                if self.request_count >= self.requests_per_minute:
-                    time_passed = current_time - self.last_request_time
-                    if time_passed < 60:
-                        sleep_time = 60 - time_passed + 2  # Add 2 second buffer
-                        logging.info(f"Rate limit reached. Waiting {sleep_time:.2f} seconds...")
-                        await asyncio.sleep(sleep_time)
-                        self.request_count = 0
-                        self.last_request_time = time.time()
+                # Check rate limit before making request
+                await self.check_rate_limit()
 
                 url = f"https://www.googleapis.com/books/v1/volumes?q=isbn:{isbn}&key={self.google_api_key}"
+                logging.debug(f"Fetching data for ISBN {isbn}")
+
                 async with self.session.get(url) as response:
                     if response.status == 200:
-                        self.request_count += 1
                         data = await response.json()
                         if data.get('items'):
                             volume_info = data['items'][0]['volumeInfo']
                             cover_url = volume_info.get('imageLinks', {}).get('thumbnail')
                             cover_path = await self.download_cover_image(isbn, cover_url) if cover_url else None
                             
-                            return BookInfo(
+                            book_info = BookInfo(
                                 isbn=isbn,
                                 title=volume_info.get('title'),
                                 authors=volume_info.get('authors', []),
@@ -180,10 +196,17 @@ class BookDataExtractor:
                                 cover_path=cover_path,
                                 source='google_books'
                             )
+                            logging.info(f"Successfully fetched data for ISBN {isbn}")
+                            return book_info
+                        else:
+                            logging.warning(f"No data found for ISBN {isbn}")
+                            return None
+                            
                     elif response.status == 429:
                         retry_count += 1
-                        wait_time = min(2 ** retry_count, 60)  # Exponential backoff
-                        logging.warning(f"Rate limit hit for ISBN {isbn}. Waiting {wait_time} seconds before retry {retry_count}/{max_retries}")
+                        wait_time = min(2 ** retry_count * 5, 60)  # Exponential backoff starting at 5 seconds
+                        logging.warning(f"Rate limit hit for ISBN {isbn}. Retry {retry_count}/{max_retries} "
+                                     f"after {wait_time} seconds")
                         await asyncio.sleep(wait_time)
                         continue
                     else:
@@ -196,6 +219,7 @@ class BookDataExtractor:
 
         logging.error(f"Max retries reached for ISBN {isbn}")
         return None
+
     def save_to_database(self, book: BookInfo):
         """Save book information to SQLite database."""
         try:
@@ -241,7 +265,7 @@ class BookDataExtractor:
         return None
 
     async def process_isbn_list(self, isbns: List[str]):
-        """Process a list of ISBNs in smaller batches with rate limiting."""
+        """Process a list of ISBNs with improved rate limiting."""
         try:
             await self.initialize_session()
             
@@ -249,40 +273,25 @@ class BookDataExtractor:
             successful_count = 0
             failed_isbns = []
             
-            # Reduce batch size for better rate limit handling
-            batch_size = 10  # Smaller batch size
-            
-            for i in range(0, len(isbns), batch_size):
-                batch = isbns[i:i + batch_size]
-                logging.info(f"Processing batch {i//batch_size + 1} of {len(isbns)//batch_size + 1}")
+            # Process ISBNs one at a time for better control
+            for isbn in isbns:
+                result = await self.process_isbn(isbn)
+                processed_count += 1
                 
-                # Process each ISBN in batch with delay between requests
-                for isbn in batch:
-                    result = await self.process_isbn(isbn)
-                    processed_count += 1
-                    
-                    if result:
-                        successful_count += 1
-                        logging.info(f"Successfully processed ISBN: {result.isbn} ({successful_count}/{processed_count})")
-                    else:
-                        failed_isbns.append(isbn)
-                        logging.warning(f"Failed to process ISBN: {isbn}")
-                    
-                    # Add small delay between requests
-                    await asyncio.sleep(0.5)
+                if result:
+                    successful_count += 1
+                    logging.info(f"Processed {processed_count}/{len(isbns)}: "
+                               f"ISBN {isbn} successful ({successful_count} total successes)")
+                else:
+                    failed_isbns.append(isbn)
+                    logging.warning(f"Processed {processed_count}/{len(isbns)}: "
+                                  f"ISBN {isbn} failed ({len(failed_isbns)} total failures)")
                 
-                # Add delay between batches
-                if i + batch_size < len(isbns):
-                    logging.info("Waiting between batches...")
-                    await asyncio.sleep(2)
-                
-                logging.info(f"Progress: {processed_count}/{len(isbns)} ISBNs processed, {successful_count} successful")
-            
-            # Log failed ISBNs for retry
+            # Save failed ISBNs
             if failed_isbns:
-                logging.info(f"Failed ISBNs ({len(failed_isbns)}): {failed_isbns}")
-                # Save failed ISBNs to file for later retry
-                with open('failed_isbns.txt', 'w') as f:
+                failed_file = 'failed_isbns.txt'
+                logging.info(f"Saving {len(failed_isbns)} failed ISBNs to {failed_file}")
+                with open(failed_file, 'w') as f:
                     f.write('\n'.join(failed_isbns))
                 
             logging.info(f"Final results: {successful_count}/{len(isbns)} ISBNs processed successfully")
